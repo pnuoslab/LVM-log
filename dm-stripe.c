@@ -24,19 +24,10 @@
 #define DM_MSG_PREFIX "striped"
 #define DM_IO_ERROR_THRESHOLD 15
 
-/* Do not apply GC low/high watermark */
-#define DM_ALWAYS_GC	0
+/* Do GC n sec after last dispatched */
+#define DM_GC_TIME		5 * NSEC_PER_SEC
 
-/* DM_LOGCHUNK * chunk size for log chunks */
-#define DM_LOGCHUNK 	8 * 1024	// nK * chunk_size(64KB)
-					// Consume 512MB each dev
-/* Every n sec, check should GC */
-#define DM_GC_TIME	5 * NSEC_PER_SEC
-
-/* GC watermark */
-#define DM_GC_HIGH	75
-#define DM_GC_LOW	25
-
+/* Every n sec, get current BW or latency */
 #define DM_MONITOR_PERIOD	1 * MSEC_PER_SEC
 
 struct logchunk {
@@ -59,6 +50,8 @@ struct stripe {
 	struct dm_dev *dev;
 	sector_t physical_start;
 
+	struct stripe_c *sc;
+
 	/* Available log chunk list */
 	struct llist_head lc;
 
@@ -70,7 +63,7 @@ struct stripe {
 
 	/* Latency Monitor */
 	struct blk_stat_callback *cb;
-	atomic64_t avglat;
+	atomic64_t avgbw;
 
 	atomic_t error_count;
 };
@@ -91,32 +84,19 @@ struct stripe_c {
 	/* Work struct used for triggering events*/
 	struct work_struct trigger_event;
 
-	/*
-	 * If addr. is remapped,
-	 * log chunk is in this tree 
-	 */
+	/* If addr. is remapped, log chunk is in this tree */
 	struct rb_root tree;
 	spinlock_t lock;
+
+	atomic64_t avgbw;	
 
 	/* GC structures */
 	struct hrtimer timer;
 
-	/*
-	 * If gc_cnt > gc_high, start GC until gc_cnt < gc_low.
-	 * The size of gc_cnt is the same as rb_tree.
-	 */
-	unsigned int gc_high;
-	unsigned int gc_low;
-	atomic_t gc_cnt;
-
-	/*
-	 * GC flags
-	 */
+	/* GC flags */
 	unsigned long flags;
 
-	/*
-	 * Reads from one dev and copies it to another when GC.
-	 */
+	/* Reads from one dev and copies it to another when GC. */
 	struct workqueue_struct *gc_readqueue;
 	struct work_struct readwork;
 	struct llist_head gc_readlist;
@@ -125,12 +105,12 @@ struct stripe_c {
 	struct work_struct writework;
 	struct llist_head gc_writelist;
 
+	/* Must be the last member */
 	struct stripe stripe[0];
 };
 
 /* GC flags */
 enum {
-	DM_GC_FLUSH,	/* Ignore GC watermark */
 	DM_GC_DTR,	/* Doing destroy */
 	DM_FLAGS	/* # of flags */
 };
@@ -178,7 +158,7 @@ static inline struct stripe_c *alloc_context(unsigned int stripes)
  * Pre-allocate log sectors.
  */
 static void lc_to_list(struct stripe_c *sc, unsigned int stripe,
-		struct logchunk *lcs)
+		struct logchunk *lcs, unsigned long nr_chunks)
 {
 	sector_t chunk = sc->ti->len;
 	u64 i;
@@ -189,7 +169,7 @@ static void lc_to_list(struct stripe_c *sc, unsigned int stripe,
 		chunk >>= sc->chunk_size_shift;
 
 	chunk += stripe;
-	for (i = 0; i < DM_LOGCHUNK; i++) {
+	for (i = 0; i < nr_chunks; i++) {
 		lcs[i].mapped = chunk;
 		llist_add(&lcs[i].list, &sc->stripe[stripe].lc);
 		lcs[i].sc = sc;
@@ -202,8 +182,16 @@ static void lc_to_list(struct stripe_c *sc, unsigned int stripe,
 static void lm_timer_fn(struct blk_stat_callback *cb)
 {
 	struct stripe *stripe = cb->data;
+	s64 prebw = atomic64_read(&stripe->avgbw);
+	s64 avgbw = 0;
+	unsigned int i;
 
-	atomic64_set(&stripe->avglat, cb->stat->mean);
+	for (i = 0; i < 6; i++)
+		avgbw += (1 << i) * 8 * cb->stat[i].nr_samples;
+
+	atomic64_sub(prebw, &stripe->sc->avgbw);
+	atomic64_set(&stripe->avgbw, avgbw);
+	atomic64_add(avgbw, &stripe->sc->avgbw);
 
 	blk_stat_activate_msecs(cb, DM_MONITOR_PERIOD);
 }
@@ -211,12 +199,19 @@ static void lm_timer_fn(struct blk_stat_callback *cb)
 static int lm_data_dir(const struct request *rq)
 {
 	const int op = req_op(rq);
-
-	if (op_is_write(op))
-		return 0;
+	unsigned int sz = blk_rq_sectors(rq);
+	unsigned int dir = 0;
 
 	/* don't account */
-	return -1;
+	if (!op_is_write(op))
+		return -1;
+
+	sz >>= 3;
+	while ((sz >>= 1))
+		if (++dir > 5)
+			return 5;
+
+	return dir;
 }
 
 /*
@@ -229,6 +224,7 @@ static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
 	char dummy;
 	int ret;
 	struct logchunk *lcs;
+	unsigned long nr_chunks;
 
 	if (sscanf(argv[1], "%llu%c", &start, &dummy) != 1)
 		return -EINVAL;
@@ -238,9 +234,17 @@ static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
 	if (ret)
 		goto err_getdev;
 
+	nr_chunks = sc->stripe[stripe].dev->bdev->bd_part->nr_sects;
+	if (sc->chunk_size_shift < 0)
+		sector_div(nr_chunks, sc->chunk_size);
+	else
+		nr_chunks >>= sc->chunk_size_shift;
+
+	nr_chunks >>= 3; /* 1 / 8 */
+
 	sc->stripe[stripe].physical_start = start;
 
-	lcs = kvmalloc_array(DM_LOGCHUNK, sizeof(struct logchunk), GFP_KERNEL);
+	lcs = kvmalloc_array(nr_chunks, sizeof(struct logchunk), GFP_KERNEL);
 	if (!lcs) {
 		ret = -ENOMEM;
 		goto err_lcs;
@@ -248,7 +252,7 @@ static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
 
 	/* Initalize available log sector list */
 	init_llist_head(&sc->stripe[stripe].lc);
-	lc_to_list(sc, stripe, lcs);
+	lc_to_list(sc, stripe, lcs, nr_chunks);
 
 	spin_lock_init(&sc->stripe[stripe].lock);
 
@@ -257,16 +261,18 @@ static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
 
 	/* Latency Monitor */
 	sc->stripe[stripe].cb = blk_stat_alloc_callback(lm_timer_fn,
-			lm_data_dir, 1, &sc->stripe[stripe]);
+			lm_data_dir, 6, &sc->stripe[stripe]);
 	if (!sc->stripe[stripe].cb) {
 		ret = -ENOMEM;
 		goto err_lm;
 	}
-	atomic64_set(&(sc->stripe[stripe].avglat), 0);
+	atomic64_set(&(sc->stripe[stripe].avgbw), 0);
 	
 	blk_stat_add_callback(sc->stripe[stripe].dev->bdev->bd_queue,
 			sc->stripe[stripe].cb);
 	blk_stat_activate_msecs(sc->stripe[stripe].cb, DM_MONITOR_PERIOD);
+
+	sc->stripe[stripe].sc = sc;
 
 	return 0;
 
@@ -319,9 +325,12 @@ static void do_gc_write(struct work_struct *work)
 			chunk <<= sc->chunk_size_shift;
 
 		bio = lc->bio;
+
+		memset(&bio->bi_iter, 0, sizeof(struct bvec_iter));
+
 		bio->bi_iter.bi_sector = chunk + sc->ti->begin;
-		bio->bi_iter.bi_idx = 0;
-		bio->bi_iter.bi_bvec_done = 0;
+		bio->bi_iter.bi_size = sc->chunk_size * SECTOR_SIZE;
+
 		bio->bi_end_io = gc_write_endio;
 		bio->bi_opf = REQ_OP_WRITE;
 
@@ -331,13 +340,8 @@ static void do_gc_write(struct work_struct *work)
 		bio->bi_iter.bi_sector += sc->stripe[stripe].physical_start;
 		bio_set_dev(bio, sc->stripe[stripe].dev->bdev);
 
-		if (gc_flagged(lc->sc, DM_GC_DTR))
-			atomic_inc(&sc->gc_cnt);
-
 		/* Make a request to the original addr. */
 		generic_make_request(bio);
-
-		atomic_dec(&sc->gc_cnt);
 
 		spin_lock(&sc->lock);
 		rb_erase(&lc->node, &sc->tree);
@@ -353,15 +357,7 @@ static void gc_read_endio(struct bio *bio)
 	struct stripe_c *sc = lc->sc;
 
 	llist_add(&lc->list, &sc->gc_writelist);
-
-	if (gc_flagged(sc, DM_GC_DTR))
-		atomic_dec(&sc->gc_cnt);
-}
-
-static inline bool gc_should_stop(struct stripe_c *sc)
-{
-	return !gc_flagged(sc, DM_GC_FLUSH)
-		&& atomic_read(&sc->gc_cnt) < sc->gc_low;
+	queue_work(sc->gc_writequeue, &sc->writework);
 }
 
 static struct bio *make_gc_bio(struct stripe_c *sc, struct logchunk *lc)
@@ -424,9 +420,6 @@ static void do_gc_read(struct work_struct *work)
 	struct llist_node *lnode;
 
 	for (;;) {
-		if (gc_should_stop(sc))
-			break;
-
 		lnode = llist_del_first(&sc->gc_readlist);
 		if (!lnode)
 			break;
@@ -441,33 +434,17 @@ static void do_gc_read(struct work_struct *work)
 		bio->bi_private = (void *) lc;
 		lc->bio = bio;
 
-		if (gc_flagged(sc, DM_GC_DTR))
-			atomic_inc(&sc->gc_cnt);
-
 		generic_make_request(bio);
 	}
 }
 
-static inline bool should_gc(struct stripe_c *sc)
-{
-	return false;
-	return gc_flagged(sc, DM_GC_FLUSH)
-		|| atomic_read(&sc->gc_cnt) > sc->gc_high;
-}
-
-static enum hrtimer_restart stripe_check_gc(struct hrtimer *timer)
+static enum hrtimer_restart stripe_do_gc(struct hrtimer *timer)
 {
 	struct stripe_c *sc = container_of(timer, struct stripe_c, timer);
 
-	if (should_gc(sc))
-		queue_work(sc->gc_readqueue, &sc->readwork);
+	queue_work(sc->gc_readqueue, &sc->readwork);
 
-	if (!llist_empty(&sc->gc_writelist))
-		queue_work(sc->gc_writequeue, &sc->writework);
-
-	hrtimer_forward_now(timer, DM_GC_TIME);
-
-	return HRTIMER_RESTART;
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -577,19 +554,15 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		atomic_set(&(sc->stripe[i].error_count), 0);
 	}
 
-	hrtimer_init(&sc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	sc->timer.function = stripe_check_gc;
-	hrtimer_start(&sc->timer, DM_GC_TIME, HRTIMER_MODE_REL);
-
 	sc->tree = RB_ROOT;
 	spin_lock_init(&sc->lock);
 
-	sc->gc_high = DM_LOGCHUNK * stripes * DM_GC_HIGH / 100;
-	sc->gc_low  = DM_LOGCHUNK * stripes * DM_GC_LOW  / 100;
-	atomic_set(&sc->gc_cnt, 0);
+	atomic64_set(&sc->avgbw, 0);
+
+	hrtimer_init(&sc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	sc->timer.function = stripe_do_gc;
+
 	bitmap_zero(&sc->flags, DM_FLAGS);
-	if (DM_ALWAYS_GC)
-		gc_set_flag(sc, DM_GC_FLUSH);
 
 	ti->private = sc;
 
@@ -636,24 +609,15 @@ static void stripe_dtr(struct dm_target *ti)
 	hrtimer_cancel(&sc->timer);
 #if 0
 	/* Flush gc_queue */
-	gc_set_flag(sc, DM_GC_FLUSH);
 	gc_set_flag(sc, DM_GC_DTR);
-
-	atomic_set(&sc->gc_cnt, 0);
 
 	queue_work(sc->gc_readqueue, &sc->readwork);
 	drain_workqueue(sc->gc_readqueue);
 	destroy_workqueue(sc->gc_readqueue);
 
-	while (atomic_read(&sc->gc_cnt))
-		cpu_relax();
-
 	queue_work(sc->gc_writequeue, &sc->writework);
 	drain_workqueue(sc->gc_writequeue);
 	destroy_workqueue(sc->gc_writequeue);
-
-	while (atomic_read(&sc->gc_cnt))
-		cpu_relax();
 #endif
 
 	for (i = 0; i < sc->stripes; i++) {
@@ -795,19 +759,29 @@ static struct logchunk *stripe_getlc(struct stripe_c *sc, uint32_t ndev)
 	return llist_entry(lnode, struct logchunk, list);
 }
 
-static uint32_t stripe_dev_reassign(struct stripe_c *sc, struct bio *bio,
+static int32_t stripe_dev_reassign(struct stripe_c *sc, struct bio *bio,
 		unsigned int weight)
 {
-	u64 lat, temp;
+	u64 mybw, temp = 0, upper_bound = 0;
+	u64 thisbw;
 	uint32_t stripe, assigned = 0;
+	int tot_weights = atomic_read(&bio->bi_disk->queue->tot_weights);
 
-	lat = U64_MAX;
+	if (!tot_weights)
+		return -1;
+
+	mybw = atomic64_read(&sc->avgbw) * weight;
+	do_div(mybw, tot_weights);
 
 	for (stripe = 0; stripe < sc->stripes; stripe++) {
-		temp = atomic64_read(&sc->stripe[stripe].avglat);
-		lat = min(lat, temp);
-		if (lat == temp)
+		thisbw = atomic64_read(&sc->stripe[stripe].avgbw);
+		if (thisbw > mybw) {
+			upper_bound = min(thisbw, upper_bound);
 			assigned = stripe;
+		} else if (thisbw > temp) {
+			temp = thisbw;
+			assigned = stripe;
+		}
 	}
 
 	return assigned;
@@ -820,7 +794,7 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 	sector_t origin = dm_target_offset(sc->ti, bio->bi_iter.bi_sector);
 	sector_t chunk_offset;
 	sector_t mapped;
-	uint32_t odev, ndev;
+	int32_t odev, ndev;
 
 	weight = bio_blkcg(bio) ? bio_blkcg(bio)->weight : 0;
 
@@ -844,7 +818,7 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 		spin_unlock(&sc->lock);
 		goto out;
 	} else {
-		if (weight != 200) {
+		if (!op_is_write(bio_op(bio))) {
 			spin_unlock(&sc->lock);
 			goto out;
 		}
@@ -854,20 +828,13 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 	}
 	spin_unlock(&sc->lock);
 
-	if (!op_is_write(bio_op(bio))) {
-		spin_lock(&sc->lock);
-		rb_erase(&temp.node, &sc->tree);
-		spin_unlock(&sc->lock);
-		goto out;
-	}
-
 	/* Original device */
 	odev = chunk_dev(sc, origin);
 
 	/* Newly reassigend device */
 	ndev = stripe_dev_reassign(sc, bio, weight);
 
-	if (ndev == odev) { /* Nothing to do */
+	if (ndev < 0 || ndev == odev) { /* Nothing to do */
 		spin_lock(&sc->lock);
 		rb_erase(&temp.node, &sc->tree);
 		spin_unlock(&sc->lock);
@@ -889,8 +856,6 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 	spin_unlock(&sc->lock);
 
 	llist_add(&lc->list, &sc->gc_readlist);
-
-	atomic_inc(&sc->gc_cnt);
 
 	mapped = lc->mapped;
 out:
@@ -1049,6 +1014,8 @@ static int stripe_end_io(struct dm_target *ti, struct bio *bio,
 	unsigned i;
 	char major_minor[16];
 	struct stripe_c *sc = ti->private;
+
+	hrtimer_start(&sc->timer, DM_GC_TIME, HRTIMER_MODE_REL);
 
 	if (!*error)
 		return DM_ENDIO_DONE; /* I/O complete */
