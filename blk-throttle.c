@@ -143,7 +143,6 @@ struct cpm_data {
 	unsigned int s[2];
 	unsigned int track[2];
 	unsigned long upd_time;
-	bool under_predict;
 };
 
 struct credit_state {
@@ -1092,8 +1091,9 @@ static inline void throtl_predict_crd(struct throtl_grp *tg, unsigned long now)
 	b = alpha * 100 / (100 - alpha) * (s[0] - s[1]) / 100;
 
 	if (tg == td->tg[MAX]) {
-		td->max_weight_credit = (a + b) * 5;
-		td->max_weight_credit *= (2 - !cpmd->under_predict);
+		td->max_weight_credit = (a + b) * 10;
+		if (td->max_weight_credit < INIT_CREDIT)
+			td->max_weight_credit = INIT_CREDIT;
 	}
 
 	crs->credit[RESD] = cpmd->cpm[SUM] = 0;
@@ -1122,7 +1122,6 @@ static inline void throtl_dist_crd(struct throtl_grp *tg) {
 
 		/* If used credit less than time_elapsed? */
 		cpmd->cpm[ACT] = crs->credit[USED] / time_elapsed;
-		cpmd->under_predict = !cpmd->cpm[ACT] ? true : false;
 	}
 	cpmd->cpm[SUM] += cpmd->cpm[ACT];
 	cpmd->cpm[ACT] = 0;
@@ -1135,10 +1134,8 @@ static inline void throtl_dist_crd(struct throtl_grp *tg) {
 	else
 		crs->credit[RESD] = 0;
 
-	/*
 	if (time_after(now, cpmd->upd_time))
 		throtl_predict_crd(tg, now);
-	*/
 dist:
 	crs->throttle = false;
 	crs->credit[CUR] = td->max_weight_credit / w_ratio;
@@ -1154,19 +1151,22 @@ static void throtl_state_check(struct throtl_data *td, unsigned long now)
 	struct blkcg_gq *blkg;
 	u32 tg_active = 0, tg_throttle = 0;
 
-	rcu_read_lock();
 	blkg_for_each_descendant_post(blkg, pos_css, td->queue->root_blkg) {
 		struct credit_data *crd = blkg_to_tg(blkg)->crd;
 
 		if (!crd->weight)
 			continue;
 
-		if (time_before(now, crd->crs.dist_time))
+		if (time_before(now, crd->crs.dist_time)) {
+			td->more_crd = false;
+			return;
+		}
+
+		if (crd->crs.credit[USED])
 			tg_active++;
 		if (crd->crs.throttle)
 			tg_throttle++;
 	}
-	rcu_read_unlock();
 
 	if (tg_active == tg_throttle)
 		td->more_crd = true;	
@@ -1185,7 +1185,6 @@ static inline void tg_elapsed_time_check(struct throtl_grp *tg, unsigned long no
 		time_elapsed = 1;
 
 	cpmd->cpm[ACT] = crs->credit[USED] / time_elapsed;
-	cpmd->under_predict = !cpmd->cpm[ACT] ? true : false;
 
 	crs->throttle = true;
 
@@ -1197,13 +1196,14 @@ static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
 	struct credit_state *crs = &tg->crd->crs;
 	unsigned int bio_size = throtl_bio_data_size(bio);
 	unsigned int CPB = bio_size / 512;
+	unsigned int remain = crs->credit[CUR] + crs->credit[RESD];
 	unsigned long now = jiffies;
 	bool time_out;
 
 again:
 	time_out = false;
 	if (time_before(now, crs->dist_time)) {
-		if (crs->credit[CUR] + crs->credit[RESD] > crs->credit[USED]) {
+		if (remain - crs->credit[USED] >= CPB) {
 			crs->credit[USED] += CPB;
 			return true;
 		} else if (!crs->throttle)
