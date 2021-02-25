@@ -32,9 +32,9 @@ static int throtl_quantum = 32;
 #define DFL_IDLE_THRESHOLD (0)
 #define DFL_HD_BASELINE_LATENCY (4000L) /* 4ms */
 #define LATENCY_FILTERED_SSD (0)
-#define INIT_CREDIT 15000
-#define CRD_UPDATE_TIME (HZ / 2)
-#define CRD_DIST_TIME (HZ / 10)
+#define INIT_CREDIT 1000
+#define CRD_UPDATE_TIME (HZ) /* 1s */
+#define CRD_DIST_TIME (HZ / 10) /* 100ms */
 #define JIFFIES_MS (HZ / 1000)
 #define MS_IN_JIFFIES(x) (x * JIFFIES_MS)
 
@@ -1062,16 +1062,18 @@ static inline void throtl_predict_crd(struct throtl_grp *tg, unsigned long now)
 	struct throtl_data *td = tg->td;
 	struct cpm_data *cpmd = &tg->crd->cpmd;
 	struct credit_state *crs = &tg->crd->crs;
+	struct throtl_grp *max_tg = td->tg[MAX];
 	int a = 0, b = 0, s[2], alpha;
 	int diff;
+
+	if (cpmd->cpm[SUM] < INIT_CREDIT)
+		goto skip;
 
 	if (!cpmd->s[0] || !cpmd->s[1])
 		cpmd->s[0] = cpmd->s[1] = cpmd->cpm[SUM];
 
 	diff = td->max_weight_credit * cpmd->track[CNT] - cpmd->track[CRD];
-
-	if (diff < 0)
-		diff *= -1;
+	diff = diff < 0 ? diff * -1 : diff;
 
 	if (diff < 1024) /* < 1MB/s */
 		alpha = 10;
@@ -1080,23 +1082,32 @@ static inline void throtl_predict_crd(struct throtl_grp *tg, unsigned long now)
 	else             /* > 2MB/s */
 		alpha = 70;
 
-	/* If cpm less than 10 ? */
 	s[0] = cpmd->cpm[SUM] * alpha / 100 + cpmd->s[0] * (100 - alpha) / 100;
 	s[1] = s[0]           * alpha / 100 + cpmd->s[1] * (100 - alpha) / 100;
 
 	cpmd->s[0] = s[0];
 	cpmd->s[1] = s[1];
 
-	a = 2*s[0] - s[1];
-	b = alpha * 100 / (100 - alpha) * (s[0] - s[1]) / 100;
+	if (tg != max_tg && time_after(now, max_tg->crd->cpmd.upd_time))
+		throtl_predict_crd(max_tg, now);
 
-	if (tg == td->tg[MAX]) {
-		td->max_weight_credit = (a + b) * 10;
-		if (td->max_weight_credit < INIT_CREDIT)
-			td->max_weight_credit = INIT_CREDIT;
+	if (tg == max_tg) {
+		a = 2*s[0] - s[1];
+		a = a < 0 ? a * -1 : a;
+
+		b = alpha * 100 / (100 - alpha) * (s[0] - s[1]) / 100;
+		b = b < 0 ? b * -1 : b;
+
+		td->max_weight_credit = (a + b) * 3;
 	}
 
-	crs->credit[RESD] = cpmd->cpm[SUM] = 0;
+	/*
+	printk("[%u] resd: %d, max: %d",
+			tg->weight, crs->credit[RESD], td->max_weight_credit);
+	*/
+skip:
+	crs->credit[RESD] &= 0xFFFF;
+	cpmd->cpm[SUM] = 0; 
 	cpmd->track[CRD] = cpmd->track[CNT] = 0;
 	cpmd->upd_time = now + CRD_UPDATE_TIME;
 }
@@ -1120,7 +1131,6 @@ static inline void throtl_dist_crd(struct throtl_grp *tg) {
 		if (!time_elapsed)
 			time_elapsed = 1;
 
-		/* If used credit less than time_elapsed? */
 		cpmd->cpm[ACT] = crs->credit[USED] / time_elapsed;
 	}
 	cpmd->cpm[SUM] += cpmd->cpm[ACT];
@@ -1157,21 +1167,17 @@ static void throtl_state_check(struct throtl_data *td, unsigned long now)
 		if (!crd->weight)
 			continue;
 
-		if (time_before(now, crd->crs.dist_time)) {
-			td->more_crd = false;
-			return;
-		}
+		if (time_after(now, crd->crs.dist_time))
+			continue;
 
 		if (crd->crs.credit[USED])
 			tg_active++;
+
 		if (crd->crs.throttle)
 			tg_throttle++;
 	}
 
-	if (tg_active == tg_throttle)
-		td->more_crd = true;	
-	else
-		td->more_crd = false;
+	td->more_crd = (tg_active == tg_throttle);
 }
 
 static inline void tg_elapsed_time_check(struct throtl_grp *tg, unsigned long now) {
@@ -1195,7 +1201,7 @@ static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
 	struct throtl_data *td = tg->td;
 	struct credit_state *crs = &tg->crd->crs;
 	unsigned int bio_size = throtl_bio_data_size(bio);
-	unsigned int CPB = bio_size / 512;
+	unsigned int CPB = bio_size >> 9;
 	unsigned int remain = crs->credit[CUR] + crs->credit[RESD];
 	unsigned long now = jiffies;
 	bool time_out;
@@ -1203,7 +1209,7 @@ static bool tg_with_in_credit_limit(struct bio *bio, struct throtl_grp *tg) {
 again:
 	time_out = false;
 	if (time_before(now, crs->dist_time)) {
-		if (remain - crs->credit[USED] >= CPB) {
+		if (remain > crs->credit[USED]) {
 			crs->credit[USED] += CPB;
 			return true;
 		} else if (!crs->throttle)
