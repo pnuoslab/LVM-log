@@ -30,40 +30,68 @@
 /* Every n sec, get current BW or latency */
 #define DM_MONITOR_PERIOD	1 * MSEC_PER_SEC
 
-struct logchunk {
+#define MAXDEVS			5
+#define LOGBLOCK_SHIFT		3
+
+struct logblock {
 	/* Original addr. */
 	sector_t origin;
 
 	/* Remapped addr. */
 	sector_t mapped;
 
-	/* GC info */
-	struct bio *bio;
-	struct stripe_c *sc;
-	uint32_t stripe;
+	uint32_t dev;
 
 	struct rb_node node;
 	struct llist_node list;
+
+	/* GC info */
+	struct bio *bio;
+	struct stripe_c *sc;
 };
 
-struct stripe {
-	struct dm_dev *dev;
-	sector_t physical_start;
+struct stripe_log {
+	struct block_device *bdev;
 
-	struct stripe_c *sc;
-
-	/* Available log chunk list */
-	struct llist_head lc;
+	/* Available log block list */
+	struct llist_head lb;
 
 	/* List Lock */
 	spinlock_t lock;
 
-	/* For kfree */
-	struct logchunk *lcs;
-
 	/* Latency Monitor */
 	struct blk_stat_callback *cb;
-	atomic64_t avgbw;
+	atomic64_t mean;
+
+	/* For kfree */
+	struct logblock *lbs;
+};
+static struct stripe_log sl[MAXDEVS];
+
+struct stripe_gc {
+	/* GC structures */
+	struct hrtimer timer;
+
+	/* GC flags */
+	unsigned long flags;
+
+	/* Reads from a dev and copies it to the another when GC. */
+	struct workqueue_struct *gc_readqueue;
+	struct work_struct readwork;
+	struct llist_head gc_readlist;
+
+	struct workqueue_struct *gc_writequeue;
+	struct work_struct writework;
+	struct llist_head gc_writelist;
+};
+static struct stripe_gc sg;
+
+/* Number of stripes */
+static unsigned int devs = 0;
+
+struct stripe {
+	struct dm_dev *dev;
+	sector_t physical_start;
 
 	atomic_t error_count;
 };
@@ -84,26 +112,9 @@ struct stripe_c {
 	/* Work struct used for triggering events*/
 	struct work_struct trigger_event;
 
-	/* If addr. is remapped, log chunk is in this tree */
+	/* If addr. is remapped, log block is in this tree */
 	struct rb_root tree;
 	spinlock_t lock;
-
-	atomic64_t avgbw;	
-
-	/* GC structures */
-	struct hrtimer timer;
-
-	/* GC flags */
-	unsigned long flags;
-
-	/* Reads from one dev and copies it to another when GC. */
-	struct workqueue_struct *gc_readqueue;
-	struct work_struct readwork;
-	struct llist_head gc_readlist;
-
-	struct workqueue_struct *gc_writequeue;
-	struct work_struct writework;
-	struct llist_head gc_writelist;
 
 	/* Must be the last member */
 	struct stripe stripe[0];
@@ -115,19 +126,19 @@ enum {
 	DM_FLAGS	/* # of flags */
 };
 
-static inline bool gc_flagged(struct stripe_c *sc, unsigned int bit)
+static inline bool gc_flagged(struct stripe_gc *sg, unsigned int bit)
 {
-	return test_bit(bit, &sc->flags);
+	return test_bit(bit, &sg->flags);
 }
 
-static inline void gc_set_flag(struct stripe_c *sc, unsigned int bit)
+static inline void gc_set_flag(struct stripe_gc *sg, unsigned int bit)
 {
-	set_bit(bit, &sc->flags);
+	set_bit(bit, &sg->flags);
 }
 
-static inline void gc_clear_flag(struct stripe_c *sc, unsigned int bit)
+static inline void gc_clear_flag(struct stripe_gc *sg, unsigned int bit)
 {
-	clear_bit(bit, &sc->flags);
+	clear_bit(bit, &sg->flags);
 }
 
 /*
@@ -155,43 +166,50 @@ static inline struct stripe_c *alloc_context(unsigned int stripes)
 }
 
 /*
- * Pre-allocate log sectors.
+ * Pre-allocate log blocks.
  */
-static void lc_to_list(struct stripe_c *sc, unsigned int stripe,
-		struct logchunk *lcs, unsigned long nr_chunks)
+
+static int get_lbs(struct stripe_c *sc, sector_t nr_sects)
 {
-	sector_t chunk = sc->ti->len;
-	u64 i;
+	sector_t chunk = nr_sects;
+	sector_t nr_lbs = chunk;
+	struct logblock *lbs;
+	unsigned int i;
+
+	if (sc->chunk_size_shift < 0)
+		sector_div(nr_lbs, sc->chunk_size);
+	else
+		nr_lbs >>= sc->chunk_size_shift;
+
+	nr_lbs = (nr_lbs >> LOGBLOCK_SHIFT) - 1;
+
+	lbs = kvmalloc_array(nr_lbs, sizeof(struct logblock), GFP_KERNEL);
+	if (!lbs)
+		return -ENOMEM;
+
+	sl[devs].lbs = lbs;
 
 	if (sc->chunk_size_shift < 0)
 		sector_div(chunk, sc->chunk_size);
 	else
 		chunk >>= sc->chunk_size_shift;
 
-	chunk += stripe;
-	for (i = 0; i < nr_chunks; i++) {
-		lcs[i].mapped = chunk;
-		llist_add(&lcs[i].list, &sc->stripe[stripe].lc);
-		lcs[i].sc = sc;
-		lcs[i].stripe = stripe;
+	chunk = chunk - nr_lbs - 1;
+	for (i = 0; i < nr_lbs; i++) {
+		lbs[i].mapped = chunk + i;
+		lbs[i].dev = devs;
 
-		chunk += sc->stripes;
+		llist_add(&lbs[i].list, &sl[devs].lb);
 	}
+
+	return 0;
 }
 
 static void lm_timer_fn(struct blk_stat_callback *cb)
 {
-	struct stripe *stripe = cb->data;
-	s64 prebw = atomic64_read(&stripe->avgbw);
-	s64 avgbw = 0;
-	unsigned int i;
+	struct stripe_log *sl = cb->data;
 
-	for (i = 0; i < 6; i++)
-		avgbw += (1 << i) * 8 * cb->stat[i].nr_samples;
-
-	atomic64_sub(prebw, &stripe->sc->avgbw);
-	atomic64_set(&stripe->avgbw, avgbw);
-	atomic64_add(avgbw, &stripe->sc->avgbw);
+	atomic64_set(&sl->mean, cb->stat->mean);
 
 	blk_stat_activate_msecs(cb, DM_MONITOR_PERIOD);
 }
@@ -199,89 +217,28 @@ static void lm_timer_fn(struct blk_stat_callback *cb)
 static int lm_data_dir(const struct request *rq)
 {
 	const int op = req_op(rq);
-	unsigned int sz = blk_rq_sectors(rq);
-	unsigned int dir = 0;
 
 	/* don't account */
 	if (!op_is_write(op))
 		return -1;
 
-	sz >>= 3;
-	while ((sz >>= 1))
-		if (++dir > 5)
-			return 5;
-
-	return dir;
+	return 0;
 }
 
-/*
- * Parse a single <dev> <sector> pair
- */
-static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
-		      unsigned int stripe, char **argv)
+/* Latency Monitor */
+static int get_lm(struct request_queue *q)
 {
-	unsigned long long start;
-	char dummy;
-	int ret;
-	struct logchunk *lcs;
-	unsigned long nr_chunks;
+	sl[devs].cb = blk_stat_alloc_callback(lm_timer_fn, lm_data_dir,
+						1, &sl[devs]);
+	if (!sl[devs].cb)
+		return -ENOMEM;
 
-	if (sscanf(argv[1], "%llu%c", &start, &dummy) != 1)
-		return -EINVAL;
-
-	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
-			    &sc->stripe[stripe].dev);
-	if (ret)
-		goto err_getdev;
-
-	nr_chunks = sc->stripe[stripe].dev->bdev->bd_part->nr_sects;
-	if (sc->chunk_size_shift < 0)
-		sector_div(nr_chunks, sc->chunk_size);
-	else
-		nr_chunks >>= sc->chunk_size_shift;
-
-	nr_chunks >>= 3; /* 1 / 8 */
-
-	sc->stripe[stripe].physical_start = start;
-
-	lcs = kvmalloc_array(nr_chunks, sizeof(struct logchunk), GFP_KERNEL);
-	if (!lcs) {
-		ret = -ENOMEM;
-		goto err_lcs;
-	}
-
-	/* Initalize available log sector list */
-	init_llist_head(&sc->stripe[stripe].lc);
-	lc_to_list(sc, stripe, lcs, nr_chunks);
-
-	spin_lock_init(&sc->stripe[stripe].lock);
-
-	/* For kfree() */
-	sc->stripe[stripe].lcs = lcs;
-
-	/* Latency Monitor */
-	sc->stripe[stripe].cb = blk_stat_alloc_callback(lm_timer_fn,
-			lm_data_dir, 6, &sc->stripe[stripe]);
-	if (!sc->stripe[stripe].cb) {
-		ret = -ENOMEM;
-		goto err_lm;
-	}
-	atomic64_set(&(sc->stripe[stripe].avgbw), 0);
+	atomic64_set(&sl[devs].mean, 0);
 	
-	blk_stat_add_callback(sc->stripe[stripe].dev->bdev->bd_queue,
-			sc->stripe[stripe].cb);
-	blk_stat_activate_msecs(sc->stripe[stripe].cb, DM_MONITOR_PERIOD);
-
-	sc->stripe[stripe].sc = sc;
+	blk_stat_add_callback(q, sl[devs].cb);
+	blk_stat_activate_msecs(sl[devs].cb, DM_MONITOR_PERIOD);
 
 	return 0;
-
-err_lm:
-	kvfree(sc->stripe[stripe].lcs);
-err_lcs:
-	dm_put_device(ti, sc->stripe[stripe].dev);
-err_getdev:
-	return ret;
 }
 
 static uint32_t chunk_dev(struct stripe_c *sc, sector_t chunk)
@@ -293,7 +250,7 @@ static uint32_t chunk_dev(struct stripe_c *sc, sector_t chunk)
 }
 
 static void stripe_map_sector(struct stripe_c *sc, sector_t sector,
-			      uint32_t *stripe, sector_t *result);
+		uint32_t *stripe, sector_t *result);
 
 static void gc_write_endio(struct bio *bio)
 {
@@ -303,28 +260,29 @@ static void gc_write_endio(struct bio *bio)
 
 static void do_gc_write(struct work_struct *work)
 {
-	struct stripe_c *sc = container_of(work, struct stripe_c, writework);
+	struct stripe_c *sc;
 	struct bio *bio;
 	struct llist_node *lnode;
-	struct logchunk *lc;
+	struct logblock *lb;
 	sector_t chunk;
 	unsigned int stripe;
 
 	for (;;) {
-		lnode = llist_del_first(&sc->gc_writelist);
+		lnode = llist_del_first(&sg.gc_writelist);
 		if (!lnode)
 			break;
 
-		lc = llist_entry(lnode, struct logchunk, list);
+		lb = llist_entry(lnode, struct logblock, list);
+		sc = lb->sc;
 
-		chunk = lc->origin;
+		chunk = lb->origin;
 
 		if (sc->stripes_shift < 0)
 			chunk *= sc->chunk_size;
 		else
 			chunk <<= sc->chunk_size_shift;
 
-		bio = lc->bio;
+		bio = lb->bio;
 
 		memset(&bio->bi_iter, 0, sizeof(struct bvec_iter));
 
@@ -344,44 +302,41 @@ static void do_gc_write(struct work_struct *work)
 		generic_make_request(bio);
 
 		spin_lock(&sc->lock);
-		rb_erase(&lc->node, &sc->tree);
+		rb_erase(&lb->node, &sc->tree);
 		spin_unlock(&sc->lock);
 
-		llist_add(&lc->list, &sc->stripe[lc->stripe].lc);
+		if (!gc_flagged(&sg, DM_GC_DTR))
+			llist_add(&lb->list, &sl[lb->dev].lb);
 	}
 }
 
 static void gc_read_endio(struct bio *bio)
 {
-	struct logchunk *lc = bio->bi_private;
-	struct stripe_c *sc = lc->sc;
+	struct logblock *lb = bio->bi_private;
 
-	llist_add(&lc->list, &sc->gc_writelist);
-	queue_work(sc->gc_writequeue, &sc->writework);
+	llist_add(&lb->list, &sg.gc_writelist);
+	queue_work(sg.gc_writequeue, &sg.writework);
 }
 
-static struct bio *make_gc_bio(struct stripe_c *sc, struct logchunk *lc)
+static struct bio *make_gc_bio(struct logblock *lb)
 {
 	struct bio *bio;
 	struct page *page;
-	sector_t chunk = dm_target_offset(sc->ti, lc->mapped);
+	struct stripe_c *sc = lb->sc;
+	sector_t chunk = dm_target_offset(sc->ti, lb->mapped);
 	unsigned int len;
 	unsigned int stripe;
 
 	len = DIV_ROUND_UP(sc->chunk_size * SECTOR_SIZE, PAGE_SIZE);
 
 	bio = bio_kmalloc(GFP_KERNEL, len);
-	if (!bio) {
-		DMWARN("bio alloc fail");
+	if (!bio)
 		goto err_bio;
-	}
 
 	for (; len != 0; len--) {
 		page = alloc_page(GFP_KERNEL);
-		if (!page) {
-			DMWARN("page alloc fail");
+		if (!page)
 			goto err_page;
-		}
 		bio_add_page(bio, page, PAGE_SIZE, 0);
 	}
 
@@ -414,25 +369,24 @@ err_bio:
 
 static void do_gc_read(struct work_struct *work)
 {
-	struct stripe_c *sc = container_of(work, struct stripe_c, readwork);
-	struct logchunk *lc;
+	struct logblock *lb;
 	struct bio *bio;
 	struct llist_node *lnode;
 
 	for (;;) {
-		lnode = llist_del_first(&sc->gc_readlist);
+		lnode = llist_del_first(&sg.gc_readlist);
 		if (!lnode)
 			break;
 
-		lc = llist_entry(lnode, struct logchunk, list);
+		lb = llist_entry(lnode, struct logblock, list);
 
-		bio = make_gc_bio(sc, lc);
+		bio = make_gc_bio(lb);
 		if (!bio) {
 			DMERR("Can't allocate bio");
-			llist_add(&lc->list, &sc->gc_readlist);
+			llist_add(&lb->list, &sg.gc_readlist);
 		}
-		bio->bi_private = (void *) lc;
-		lc->bio = bio;
+		bio->bi_private = (void *) lb;
+		lb->bio = bio;
 
 		generic_make_request(bio);
 	}
@@ -440,11 +394,112 @@ static void do_gc_read(struct work_struct *work)
 
 static enum hrtimer_restart stripe_do_gc(struct hrtimer *timer)
 {
-	struct stripe_c *sc = container_of(timer, struct stripe_c, timer);
-
-	queue_work(sc->gc_readqueue, &sc->readwork);
+	queue_work(sg.gc_readqueue, &sg.readwork);
 
 	return HRTIMER_NORESTART;
+}
+
+static int get_gc(struct stripe_c *sc)
+{
+	int ret = 0;
+
+	bitmap_zero(&sg.flags, DM_FLAGS);
+
+	hrtimer_init(&sg.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	sg.timer.function = stripe_do_gc;
+
+	sg.gc_readqueue = alloc_workqueue("kdmgcread", WQ_MEM_RECLAIM, 0);
+	if (!sg.gc_readqueue) {
+		sc->ti->error = "Couldn't allocate workqueue";
+		ret = -ENOMEM;
+		goto err_gc_readqueue;
+	}
+	INIT_WORK(&sg.readwork, do_gc_read);
+	init_llist_head(&sg.gc_readlist);
+
+	sg.gc_writequeue = alloc_workqueue("kdmgcwrite", WQ_MEM_RECLAIM, 0);
+	if (!sg.gc_writequeue) {
+		sc->ti->error = "Couldn't allocate workqueue";
+		ret = -ENOMEM;
+		goto err_gc_writequeue;
+	}
+	INIT_WORK(&sg.writework, do_gc_write);
+	init_llist_head(&sg.gc_writelist);
+
+	return 0;
+
+err_gc_writequeue:
+	destroy_workqueue(sg.gc_readqueue);
+err_gc_readqueue:
+	hrtimer_cancel(&sg.timer);
+
+	return ret;
+}
+
+static int get_sl(struct stripe_c *sc, struct dm_dev *dev)
+{
+	int ret;
+	u64 i;
+
+	for (i = 0; i<MAXDEVS; i++)
+		if (sl[i].bdev == dev->bdev)
+			return 0;
+
+	sl[devs].bdev = dev->bdev;
+
+	/* Initalize available log sector list and lock */
+	init_llist_head(&sl[devs].lb);
+	spin_lock_init(&sl[devs].lock);
+
+	ret = get_lbs(sc, dev->bdev->bd_part->nr_sects);
+	if (ret)
+		goto err_lbs;
+
+	ret = get_lm(dev->bdev->bd_queue);
+	if (ret)
+		goto err_lm;
+
+	if (!devs) {
+		ret = get_gc(sc);
+		if (ret)
+			goto err_gc;
+	}
+
+	devs++;
+
+	return 0;
+err_gc:
+	blk_stat_remove_callback(sl[devs].bdev->bd_queue, sl[devs].cb);
+	blk_stat_free_callback(sl[devs].cb);
+err_lm:
+	kvfree(sl[devs].lbs);
+err_lbs:
+	dm_put_device(sc->ti, dev);
+
+	return ret;
+}
+
+/*
+ * Parse a single <dev> <sector> pair
+ */
+static int get_stripe(struct dm_target *ti, struct stripe_c *sc,
+		unsigned int stripe, char **argv)
+{
+	unsigned long long start;
+	char dummy;
+	int ret;
+
+	if (sscanf(argv[1], "%llu%c", &start, &dummy) != 1)
+		return -EINVAL;
+
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
+			&sc->stripe[stripe].dev);
+	if (ret)
+		return ret;
+
+	sc->stripe[stripe].physical_start = start;
+
+	return get_sl(sc, sc->stripe[stripe].dev);
 }
 
 /*
@@ -478,14 +533,14 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	width = ti->len;
 	if (sector_div(width, stripes)) {
 		ti->error = "Target length not divisible by "
-		    "number of stripes";
+			"number of stripes";
 		return -EINVAL;
 	}
 
 	tmp_len = width;
 	if (sector_div(tmp_len, chunk_size)) {
 		ti->error = "Target length not divisible by "
-		    "chunk size";
+			"chunk size";
 		return -EINVAL;
 	}
 
@@ -501,7 +556,7 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc = alloc_context(stripes);
 	if (!sc) {
 		ti->error = "Memory allocation for striped context "
-		    "failed";
+			"failed";
 		return -ENOMEM;
 	}
 
@@ -542,14 +597,9 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		r = get_stripe(ti, sc, i, argv);
 		if (r < 0) {
 			ti->error = "Couldn't parse stripe destination";
-			while (i--) {
-				kvfree(sc->stripe[i].lcs);
-				blk_stat_remove_callback(sc->stripe[i].dev->bdev->bd_queue,
-							sc->stripe[i].cb);
-				blk_stat_free_callback(sc->stripe[i].cb);
+			while (i--)
 				dm_put_device(ti, sc->stripe[i].dev);
-			}
-			goto err_stripe;
+			return r;
 		}
 		atomic_set(&(sc->stripe[i].error_count), 0);
 	}
@@ -557,45 +607,9 @@ static int stripe_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sc->tree = RB_ROOT;
 	spin_lock_init(&sc->lock);
 
-	atomic64_set(&sc->avgbw, 0);
-
-	hrtimer_init(&sc->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	sc->timer.function = stripe_do_gc;
-
-	bitmap_zero(&sc->flags, DM_FLAGS);
-
 	ti->private = sc;
 
-	sc->gc_readqueue = alloc_workqueue("kdmgcread", WQ_MEM_RECLAIM, 0);
-	if (!sc->gc_readqueue) {
-		ti->error = "Couldn't allocate workqueue";
-		r = -EINVAL;
-		goto err_gc_readqueue;
-	}
-	INIT_WORK(&sc->readwork, do_gc_read);
-	init_llist_head(&sc->gc_readlist);
-
-	sc->gc_writequeue = alloc_workqueue("kdmgcwrite", WQ_MEM_RECLAIM, 0);
-	if (!sc->gc_writequeue) {
-		ti->error = "Couldn't allocate workqueue";
-		r = -EINVAL;
-		goto err_gc_writequeue;
-	}
-	INIT_WORK(&sc->writework, do_gc_write);
-	init_llist_head(&sc->gc_writelist);
-
 	return 0;
-err_gc_writequeue:
-	destroy_workqueue(sc->gc_readqueue);
-err_gc_readqueue:
-	hrtimer_cancel(&sc->timer);
-	for (i = 0; i < sc->stripes; i++) {
-		kvfree(sc->stripe[i].lcs);
-		blk_stat_remove_callback(sc->stripe[i].dev->bdev->bd_queue,
-					sc->stripe[i].cb);
-		blk_stat_free_callback(sc->stripe[i].cb);
-		dm_put_device(ti, sc->stripe[i].dev);
-	}
 err_stripe:
 	kfree(sc);
 	return r;
@@ -606,27 +620,8 @@ static void stripe_dtr(struct dm_target *ti)
 	unsigned int i;
 	struct stripe_c *sc = (struct stripe_c *) ti->private;
 
-	hrtimer_cancel(&sc->timer);
-#if 0
-	/* Flush gc_queue */
-	gc_set_flag(sc, DM_GC_DTR);
-
-	queue_work(sc->gc_readqueue, &sc->readwork);
-	drain_workqueue(sc->gc_readqueue);
-	destroy_workqueue(sc->gc_readqueue);
-
-	queue_work(sc->gc_writequeue, &sc->writework);
-	drain_workqueue(sc->gc_writequeue);
-	destroy_workqueue(sc->gc_writequeue);
-#endif
-
-	for (i = 0; i < sc->stripes; i++) {
-		kvfree(sc->stripe[i].lcs);
-		blk_stat_remove_callback(sc->stripe[i].dev->bdev->bd_queue,
-				sc->stripe[i].cb);
-		blk_stat_free_callback(sc->stripe[i].cb);
+	for (i = 0; i < sc->stripes; i++)
 		dm_put_device(ti, sc->stripe[i].dev);
-	}
 
 	flush_work(&sc->trigger_event);
 
@@ -634,7 +629,7 @@ static void stripe_dtr(struct dm_target *ti)
 }
 
 static void stripe_map_sector(struct stripe_c *sc, sector_t sector,
-			      uint32_t *stripe, sector_t *result)
+		uint32_t *stripe, sector_t *result)
 {
 	sector_t chunk = dm_target_offset(sc->ti, sector);
 	sector_t chunk_offset;
@@ -662,7 +657,7 @@ static void stripe_map_sector(struct stripe_c *sc, sector_t sector,
 }
 
 static void stripe_map_range_sector(struct stripe_c *sc, sector_t sector,
-				    uint32_t target_stripe, sector_t *result)
+		uint32_t target_stripe, sector_t *result)
 {
 	uint32_t stripe;
 
@@ -682,14 +677,14 @@ static void stripe_map_range_sector(struct stripe_c *sc, sector_t sector,
 }
 
 static int stripe_map_range(struct stripe_c *sc, struct bio *bio,
-			    uint32_t target_stripe)
+		uint32_t target_stripe)
 {
 	sector_t begin, end;
 
 	stripe_map_range_sector(sc, bio->bi_iter.bi_sector,
-				target_stripe, &begin);
+			target_stripe, &begin);
 	stripe_map_range_sector(sc, bio_end_sector(bio),
-				target_stripe, &end);
+			target_stripe, &end);
 	if (begin < end) {
 		bio_set_dev(bio, sc->stripe[target_stripe].dev->bdev);
 		bio->bi_iter.bi_sector = begin +
@@ -703,19 +698,19 @@ static int stripe_map_range(struct stripe_c *sc, struct bio *bio,
 	}
 }
 
-static int rb_insert(struct rb_root *root, struct logchunk *new)
+static int rb_insert(struct rb_root *root, struct logblock *new)
 {
 	struct rb_node **link = &(root->rb_node), *parent = NULL;
 	sector_t val = new->origin;
-	struct logchunk *lc;
+	struct logblock *lb;
 
 	while (*link) {
-		lc = rb_entry(*link, struct logchunk, node);
+		lb = rb_entry(*link, struct logblock, node);
 
 		parent = *link;
-		if (val < lc->origin)
+		if (val < lb->origin)
 			link = &((*link)->rb_left);
-		else if (val > lc->origin)
+		else if (val > lb->origin)
 			link = &((*link)->rb_right);
 		else
 			return -EINVAL;
@@ -727,76 +722,60 @@ static int rb_insert(struct rb_root *root, struct logchunk *new)
 	return 0;
 }
 
-static struct logchunk *rb_search(struct rb_root *root, sector_t val)
+static struct logblock *rb_search(struct rb_root *root, sector_t val)
 {
 	struct rb_node *node = root->rb_node;
-	struct logchunk *lc = NULL;
+	struct logblock *lb = NULL;
 
 	while (node) {
-		lc = rb_entry(node, struct logchunk, node);
+		lb = rb_entry(node, struct logblock, node);
 
-		if (val < lc->origin)
+		if (val < lb->origin)
 			node = node->rb_left;
-		else if (val > lc->origin)
+		else if (val > lb->origin)
 			node = node->rb_right;
 		else
-			return lc;
+			return lb;
 	}
 
 	return NULL;
 }
 
-static struct logchunk *stripe_getlc(struct stripe_c *sc, uint32_t ndev)
+static struct logblock *stripe_getlb(struct stripe_c *sc, uint32_t ndev)
 {
 	struct llist_node *lnode;
+	struct block_device *bdev = sc->stripe[ndev].dev->bdev;
+	unsigned int i;
 
-	spin_lock(&sc->stripe[ndev].lock);
-	lnode = llist_del_first(&sc->stripe[ndev].lc);
-	spin_unlock(&sc->stripe[ndev].lock);
-	if (!lnode)
+	for (i = 0; i < devs; i++)
+		if (bdev == sl[i].bdev)
+			break;
+
+	if (i == devs)
 		return NULL;
 
-	return llist_entry(lnode, struct logchunk, list);
+	spin_lock(&sl[i].lock);
+	lnode = llist_del_first(&sl[i].lb);
+	spin_unlock(&sl[i].lock);
+
+	return lnode ? llist_entry(lnode, struct logblock, list) : NULL;
 }
 
 static int32_t stripe_dev_reassign(struct stripe_c *sc, struct bio *bio,
 		unsigned int weight)
 {
-	u64 mybw, temp = 0, upper_bound = 0;
-	u64 thisbw;
-	uint32_t stripe, assigned = 0;
-	int tot_weights = atomic_read(&bio->bi_disk->queue->tot_weights);
-
-	if (!tot_weights)
-		return -1;
-
-	mybw = atomic64_read(&sc->avgbw) * weight;
-	do_div(mybw, tot_weights);
-
-	for (stripe = 0; stripe < sc->stripes; stripe++) {
-		thisbw = atomic64_read(&sc->stripe[stripe].avgbw);
-		if (thisbw > mybw) {
-			upper_bound = min(thisbw, upper_bound);
-			assigned = stripe;
-		} else if (thisbw > temp) {
-			temp = thisbw;
-			assigned = stripe;
-		}
-	}
-
-	return assigned;
+	return weight == 1000 ? 1 : -1;
 }
 
-static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
+static bool stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 {
 	unsigned int weight;
-	struct logchunk *lc = NULL, temp;
+	struct logblock *lb = NULL, temp;
 	sector_t origin = dm_target_offset(sc->ti, bio->bi_iter.bi_sector);
 	sector_t chunk_offset;
 	sector_t mapped;
 	int32_t odev, ndev;
-
-	weight = bio_blkcg(bio) ? bio_blkcg(bio)->weight : 0;
+	bool reassigned = false;
 
 	if (sc->chunk_size_shift < 0)
 		chunk_offset = sector_div(origin, sc->chunk_size);
@@ -807,15 +786,16 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 	mapped = origin;
 
 	/*
-	 * If lc isn't null, this addr. is already mapped
+	 * If lb isn't null, this addr. is already mapped
 	 * Else, prepare to insert node
 	 */
 	spin_lock(&sc->lock);
-	lc = rb_search(&sc->tree, origin);
-	if (lc) {
-		if (lc->sc)
-			mapped = lc->mapped;
+	lb = rb_search(&sc->tree, origin);
+	if (lb) {
+		if (lb->sc)
+			mapped = lb->mapped;
 		spin_unlock(&sc->lock);
+		reassigned = true;
 		goto out;
 	} else {
 		if (!op_is_write(bio_op(bio))) {
@@ -828,36 +808,37 @@ static void stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
 	}
 	spin_unlock(&sc->lock);
 
-	/* Original device */
 	odev = chunk_dev(sc, origin);
 
-	/* Newly reassigend device */
+	weight = bio_blkcg(bio) ? bio_blkcg(bio)->weight : 0;
 	ndev = stripe_dev_reassign(sc, bio, weight);
 
-	if (ndev < 0 || ndev == odev) { /* Nothing to do */
+	if (ndev < 0 || ndev == odev) {
 		spin_lock(&sc->lock);
 		rb_erase(&temp.node, &sc->tree);
 		spin_unlock(&sc->lock);
 		goto out;
 	}
 
-	lc = stripe_getlc(sc, ndev);
-	if (!lc) { /* Nothing to do */
+	lb = stripe_getlb(sc, ndev);
+	if (!lb) {
 		spin_lock(&sc->lock);
 		rb_erase(&temp.node, &sc->tree);
 		spin_unlock(&sc->lock);
 		goto out;
 	}
 
-	lc->origin = origin;
+	lb->origin = origin;
+	lb->sc = sc;
 
 	spin_lock(&sc->lock);
-	rb_replace_node(&temp.node, &lc->node, &sc->tree);
+	rb_replace_node(&temp.node, &lb->node, &sc->tree);
 	spin_unlock(&sc->lock);
 
-	llist_add(&lc->list, &sc->gc_readlist);
+	llist_add(&lb->list, &sg.gc_readlist);
 
-	mapped = lc->mapped;
+	mapped = lb->mapped;
+	reassigned = true;
 out:
 	if (sc->chunk_size_shift < 0)
 		mapped *= sc->chunk_size;
@@ -865,6 +846,8 @@ out:
 		mapped <<= sc->chunk_size_shift;
 
 	bio->bi_iter.bi_sector = mapped + chunk_offset + sc->ti->begin;
+
+	return reassigned;
 }
 
 static int stripe_map(struct dm_target *ti, struct bio *bio)
@@ -872,6 +855,9 @@ static int stripe_map(struct dm_target *ti, struct bio *bio)
 	struct stripe_c *sc = ti->private;
 	uint32_t stripe;
 	unsigned target_bio_nr;
+	bool reassigned = false;
+
+	reassigned = stripe_check_and_assign(sc, bio);
 
 	if (bio->bi_opf & REQ_PREFLUSH) {
 		target_bio_nr = dm_bio_get_target_bio_nr(bio);
@@ -880,20 +866,19 @@ static int stripe_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_REMAPPED;
 	}
 	if (unlikely(bio_op(bio) == REQ_OP_DISCARD) ||
-	    unlikely(bio_op(bio) == REQ_OP_SECURE_ERASE) ||
-	    unlikely(bio_op(bio) == REQ_OP_WRITE_ZEROES) ||
-	    unlikely(bio_op(bio) == REQ_OP_WRITE_SAME)) {
+			unlikely(bio_op(bio) == REQ_OP_SECURE_ERASE) ||
+			unlikely(bio_op(bio) == REQ_OP_WRITE_ZEROES) ||
+			unlikely(bio_op(bio) == REQ_OP_WRITE_SAME)) {
 		target_bio_nr = dm_bio_get_target_bio_nr(bio);
 		BUG_ON(target_bio_nr >= sc->stripes);
 		return stripe_map_range(sc, bio, target_bio_nr);
 	}
 
-	stripe_check_and_assign(sc, bio);
-
 	stripe_map_sector(sc, bio->bi_iter.bi_sector,
-		&stripe, &bio->bi_iter.bi_sector);
+			&stripe, &bio->bi_iter.bi_sector);
 
-	bio->bi_iter.bi_sector += sc->stripe[stripe].physical_start;
+	if (!reassigned)
+		bio->bi_iter.bi_sector += sc->stripe[stripe].physical_start;
 	bio_set_dev(bio, sc->stripe[stripe].dev->bdev);
 
 	return DM_MAPIO_REMAPPED;
@@ -979,32 +964,32 @@ static size_t stripe_dax_copy_to_iter(struct dm_target *ti, pgoff_t pgoff,
  */
 
 static void stripe_status(struct dm_target *ti, status_type_t type,
-			  unsigned status_flags, char *result, unsigned maxlen)
+		unsigned status_flags, char *result, unsigned maxlen)
 {
 	struct stripe_c *sc = (struct stripe_c *) ti->private;
 	unsigned int sz = 0;
 	unsigned int i;
 
 	switch (type) {
-	case STATUSTYPE_INFO:
-		DMEMIT("%d ", sc->stripes);
-		for (i = 0; i < sc->stripes; i++)  {
-			DMEMIT("%s ", sc->stripe[i].dev->name);
-		}
-		DMEMIT("1 ");
-		for (i = 0; i < sc->stripes; i++) {
-			DMEMIT("%c", atomic_read(&(sc->stripe[i].error_count)) ?
-			       'D' : 'A');
-		}
-		break;
+		case STATUSTYPE_INFO:
+			DMEMIT("%d ", sc->stripes);
+			for (i = 0; i < sc->stripes; i++)  {
+				DMEMIT("%s ", sc->stripe[i].dev->name);
+			}
+			DMEMIT("1 ");
+			for (i = 0; i < sc->stripes; i++) {
+				DMEMIT("%c", atomic_read(&(sc->stripe[i].error_count)) ?
+						'D' : 'A');
+			}
+			break;
 
-	case STATUSTYPE_TABLE:
-		DMEMIT("%d %llu", sc->stripes,
-			(unsigned long long)sc->chunk_size);
-		for (i = 0; i < sc->stripes; i++)
-			DMEMIT(" %s %llu", sc->stripe[i].dev->name,
-			    (unsigned long long)sc->stripe[i].physical_start);
-		break;
+		case STATUSTYPE_TABLE:
+			DMEMIT("%d %llu", sc->stripes,
+					(unsigned long long)sc->chunk_size);
+			for (i = 0; i < sc->stripes; i++)
+				DMEMIT(" %s %llu", sc->stripe[i].dev->name,
+						(unsigned long long)sc->stripe[i].physical_start);
+			break;
 	}
 }
 
@@ -1015,7 +1000,7 @@ static int stripe_end_io(struct dm_target *ti, struct bio *bio,
 	char major_minor[16];
 	struct stripe_c *sc = ti->private;
 
-	hrtimer_start(&sc->timer, DM_GC_TIME, HRTIMER_MODE_REL);
+	hrtimer_start(&sg.timer, DM_GC_TIME, HRTIMER_MODE_REL);
 
 	if (!*error)
 		return DM_ENDIO_DONE; /* I/O complete */
@@ -1039,7 +1024,7 @@ static int stripe_end_io(struct dm_target *ti, struct bio *bio,
 		if (!strcmp(sc->stripe[i].dev->name, major_minor)) {
 			atomic_inc(&(sc->stripe[i].error_count));
 			if (atomic_read(&(sc->stripe[i].error_count)) <
-			    DM_IO_ERROR_THRESHOLD)
+					DM_IO_ERROR_THRESHOLD)
 				schedule_work(&sc->trigger_event);
 		}
 
@@ -1047,7 +1032,7 @@ static int stripe_end_io(struct dm_target *ti, struct bio *bio,
 }
 
 static int stripe_iterate_devices(struct dm_target *ti,
-				  iterate_devices_callout_fn fn, void *data)
+		iterate_devices_callout_fn fn, void *data)
 {
 	struct stripe_c *sc = ti->private;
 	int ret = 0;
@@ -1055,15 +1040,15 @@ static int stripe_iterate_devices(struct dm_target *ti,
 
 	do {
 		ret = fn(ti, sc->stripe[i].dev,
-			 sc->stripe[i].physical_start,
-			 sc->stripe_width, data);
+				sc->stripe[i].physical_start,
+				sc->stripe_width, data);
 	} while (!ret && ++i < sc->stripes);
 
 	return ret;
 }
 
 static void stripe_io_hints(struct dm_target *ti,
-			    struct queue_limits *limits)
+		struct queue_limits *limits)
 {
 	struct stripe_c *sc = ti->private;
 	unsigned chunk_size = sc->chunk_size << SECTOR_SHIFT;
@@ -1102,5 +1087,28 @@ int __init dm_stripe_init(void)
 
 void dm_stripe_exit(void)
 {
+	unsigned int i;
+
+	for (i = 0; i < devs; i++) {
+		kvfree(sl[i].lbs);
+		blk_stat_remove_callback(sl[i].bdev->bd_queue, sl[i].cb);
+		blk_stat_free_callback(sl[i].cb);
+
+		hrtimer_cancel(&sg.timer);
+
+		/* Flush gc_queue */
+		gc_set_flag(&sg, DM_GC_DTR);
+
+		queue_work(sg.gc_readqueue, &sg.readwork);
+		drain_workqueue(sg.gc_readqueue);
+		destroy_workqueue(sg.gc_readqueue);
+
+		while (!llist_empty(&sg.gc_readlist) ||
+				!llist_empty(&sg.gc_writelist))
+			cpu_relax();
+
+		destroy_workqueue(sg.gc_writequeue);
+	}
+
 	dm_unregister_target(&stripe_target);
 }
