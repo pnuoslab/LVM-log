@@ -764,7 +764,23 @@ static struct logblock *stripe_getlb(struct stripe_c *sc, uint32_t ndev)
 static int32_t stripe_dev_reassign(struct stripe_c *sc, struct bio *bio,
 		unsigned int weight)
 {
-	return weight == 1000 ? 1 : -1;
+	u64 min_lat = U64_MAX;
+	unsigned int ndev = -1, i;
+
+	if (weight != atomic_read(&bio->queue->max_weight))
+		return -1;
+
+	for (i = 0; i < sc->stripes; i++) {
+		if (sl[i].cb->stat->nr_samples == 0)
+			return -1;
+
+		if (min_lat > sl[i].cb->stat->mean) {
+			ndev = i;
+			min_lat = sl[i].cb->stat->mean;
+		}
+	}
+
+	return ndev;
 }
 
 static bool stripe_check_and_assign(struct stripe_c *sc, struct bio *bio)
