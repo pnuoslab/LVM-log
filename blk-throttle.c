@@ -669,8 +669,6 @@ static void throtl_find_weight (struct throtl_data *td)
 	unsigned int max_weight = 0;
 	unsigned int min_weight = 1100;
 
-	atomic_set(&td->queue->tot_weights, 0);
-
 	rcu_read_lock();
 	blkg_for_each_descendant_post(blkg, pos_css, td->queue->root_blkg) {
 		struct throtl_grp *tg = blkg_to_tg(blkg);
@@ -686,9 +684,10 @@ static void throtl_find_weight (struct throtl_data *td)
 			min_weight = tg->weight;
 			td->tg[MIN] = tg;
 		}
-		atomic_add(tg->weight, &td->queue->tot_weights);
 	}
 	rcu_read_unlock();
+
+	atomic_set(&td->queue->max_weight, max_weight);
 }
 
 static void throtl_pd_online(struct blkg_policy_data *pd)

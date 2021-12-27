@@ -767,7 +767,7 @@ static int32_t stripe_dev_reassign(struct stripe_c *sc, struct bio *bio,
 	u64 min_lat = U64_MAX;
 	unsigned int ndev = -1, i;
 
-	if (weight != atomic_read(&bio->queue->max_weight))
+	if (weight != atomic_read(&bio->bi_disk->queue->max_weight))
 		return -1;
 
 	for (i = 0; i < sc->stripes; i++) {

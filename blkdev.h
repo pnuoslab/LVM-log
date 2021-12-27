@@ -591,7 +591,7 @@ struct request_queue {
 #define BLK_MAX_WRITE_HINTS	5
 	u64			write_hints[BLK_MAX_WRITE_HINTS];
 
-	atomic_t		tot_weights;
+	atomic_t		max_weight;
 };
 
 #define QUEUE_FLAG_STOPPED	0	/* queue is stopped */
